@@ -5,11 +5,30 @@ A reference module for AI-powered trading systems.
 Import this file to give your AI context about rules, strategies,
 indicators, and risk management guidelines at runtime.
 
+CRASH MODE: If the NASDAQ is experiencing a significant decline, this module
+automatically defers to nasdaq_crash_protocol.py for overriding rules.
+Last updated: 2026-06-27
+
 Example usage:
     from trading_reference import RISK_RULES, INDICATOR_GUIDE, build_trading_context
     context = build_trading_context(ticker="AAPL", price=195.50, rsi=72)
     # Pass `context` as a system prompt or user message to your AI model
 """
+
+# ---------------------------------------------------------------------------
+# CRASH-MODE INTEGRATION
+# ---------------------------------------------------------------------------
+try:
+    from nasdaq_crash_protocol import (
+        is_crash,
+        CRASH_RULES,
+        CRASH_PROMPT,
+        get_crash_summary,
+        SECTOR_GUIDANCE as CRASH_SECTOR_GUIDANCE,
+    )
+    CRASH_PROTOCOL_AVAILABLE = True
+except ImportError:
+    CRASH_PROTOCOL_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # RISK MANAGEMENT RULES
@@ -108,6 +127,7 @@ STRATEGIES = {
             "Stop-loss hit",
         ],
         "best_market_conditions": "Strong bull market, sector in favor",
+        "crash_mode_allowed": False,
     },
     "mean_reversion": {
         "description": "Buy oversold stocks expecting a bounce back to average.",
@@ -123,6 +143,7 @@ STRATEGIES = {
             "Take-profit target hit",
         ],
         "best_market_conditions": "Sideways or range-bound market",
+        "crash_mode_allowed": False,
     },
     "breakout": {
         "description": "Enter when price breaks above a resistance level with volume.",
@@ -138,6 +159,7 @@ STRATEGIES = {
             "Volume dries up after breakout (weak follow-through)",
         ],
         "best_market_conditions": "Early-to-mid bull market, high market breadth",
+        "crash_mode_allowed": False,
     },
     "trend_following": {
         "description": "Stay in the direction of the dominant trend using moving averages.",
@@ -152,6 +174,28 @@ STRATEGIES = {
             "MACD turns negative",
         ],
         "best_market_conditions": "Sustained trending markets (up or down)",
+        "crash_mode_allowed": False,
+    },
+    "crash_defense": {
+        "description": "Capital preservation during a market crash or severe correction.",
+        "entry_signals": [
+            "NASDAQ drops 3 %+ intraday (crash mode triggered)",
+            "VIX spikes above 35",
+            "Broad market circuit breaker activated",
+        ],
+        "allowed_positions": [
+            "Inverse ETFs: SQQQ (3x short NASDAQ), PSQ (1x short NASDAQ)",
+            "Defensive sectors: Consumer Staples, Utilities, Healthcare",
+            "Gold / GLD as safe haven",
+            "Cash (primary position)",
+        ],
+        "exit_signals": [
+            "VIX falls back below 25",
+            "NASDAQ closes above 10-day EMA for 3 consecutive days",
+            "Recovery signals confirmed (see nasdaq_crash_protocol.py)",
+        ],
+        "best_market_conditions": "Active crash or severe bear market",
+        "crash_mode_allowed": True,
     },
 }
 
@@ -181,6 +225,14 @@ MARKET_CONDITIONS = {
         "Low trading volume (summer/holiday periods)",
         "Major economic data releases imminent (CPI, NFP, FOMC)",
     ],
+    "crash_signs": [
+        "NASDAQ down 3 %+ intraday",
+        "VIX above 35 and rising rapidly",
+        "Multiple sectors selling off simultaneously",
+        "Circuit breakers triggered on major exchanges",
+        "High-volume panic selling with no sector sparing",
+        "NASDAQ 2026-06-27: significant decline — crash protocol active",
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -188,6 +240,10 @@ MARKET_CONDITIONS = {
 # ---------------------------------------------------------------------------
 DECISION_FRAMEWORK = """
 When evaluating a trade, analyze in this order:
+
+0. CRASH CHECK — Is the NASDAQ down 3 %+ today or VIX above 35?
+   If YES: switch to nasdaq_crash_protocol.py rules immediately.
+   Normal steps below apply ONLY when crash mode is NOT active.
 
 1. MARKET REGIME — Is the overall market bullish, bearish, or neutral?
    Only take long positions confidently in bullish regimes.
@@ -225,25 +281,42 @@ def build_trading_context(
     rsi: float | None = None,
     macd_signal: str | None = None,    # "bullish", "bearish", or "neutral"
     above_200sma: bool | None = None,
-    market_regime: str | None = None,  # "bullish", "bearish", or "neutral"
+    market_regime: str | None = None,  # "bullish", "bearish", "neutral", or "crash"
+    nasdaq_change_pct: float | None = None,
+    vix: float | None = None,
     extra_notes: str = "",
 ) -> str:
     """
     Build a structured context string to prepend to an AI prompt.
-    Pass the returned string as a system message or user context block.
+    Automatically switches to crash-mode rules if conditions warrant it.
 
     Example:
         context = build_trading_context("NVDA", 875.0, rsi=65,
                                          macd_signal="bullish",
                                          above_200sma=True,
-                                         market_regime="bullish")
-        # Then send to Claude or another model as system context
+                                         market_regime="crash",
+                                         nasdaq_change_pct=-4.7,
+                                         vix=38)
     """
+    # Check for crash conditions
+    crash_active = False
+    if CRASH_PROTOCOL_AVAILABLE and nasdaq_change_pct is not None:
+        crash_active = is_crash(nasdaq_change_pct, vix)
+    if market_regime and market_regime.lower() == "crash":
+        crash_active = True
+
     lines = [
         "=== TRADING REFERENCE CONTEXT ===",
         f"Ticker          : {ticker}",
         f"Current Price   : ${price:,.2f}",
+        f"Date            : 2026-06-27",
     ]
+
+    if nasdaq_change_pct is not None:
+        lines.append(f"NASDAQ Today    : {nasdaq_change_pct:+.2f}%")
+
+    if vix is not None:
+        lines.append(f"VIX             : {vix:.1f}")
 
     if rsi is not None:
         guide = INDICATOR_GUIDE["RSI"]
@@ -266,14 +339,25 @@ def build_trading_context(
     if market_regime:
         lines.append(f"Market Regime   : {market_regime.upper()}")
 
+    lines.append("")
+
+    if crash_active and CRASH_PROTOCOL_AVAILABLE:
+        lines += [
+            "*** CRASH MODE ACTIVE — NORMAL RULES SUSPENDED ***",
+            CRASH_PROMPT,
+        ]
+    else:
+        active_rules = RISK_RULES
+        lines += [
+            "--- Risk Rules (Normal Mode) ---",
+            f"Max position size   : {active_rules['max_position_size_pct']}% of portfolio",
+            f"Stop-loss default   : {active_rules['stop_loss_pct']}% below entry",
+            f"Take-profit default : {active_rules['take_profit_pct']}% above entry",
+            f"Min R:R ratio       : {active_rules['min_risk_reward_ratio']}:1",
+            f"Cash reserve        : {active_rules['cash_reserve_pct']}% minimum",
+        ]
+
     lines += [
-        "",
-        "--- Risk Rules ---",
-        f"Max position size   : {RISK_RULES['max_position_size_pct']}% of portfolio",
-        f"Stop-loss default   : {RISK_RULES['stop_loss_pct']}% below entry",
-        f"Take-profit default : {RISK_RULES['take_profit_pct']}% above entry",
-        f"Min R:R ratio       : {RISK_RULES['min_risk_reward_ratio']}:1",
-        f"Cash reserve        : {RISK_RULES['cash_reserve_pct']}% minimum",
         "",
         "--- Decision Framework ---",
         DECISION_FRAMEWORK,
@@ -290,13 +374,17 @@ def build_trading_context(
 # QUICK SELF-TEST
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    sample = build_trading_context(
-        ticker="AAPL",
-        price=195.50,
-        rsi=42,
-        macd_signal="bullish",
-        above_200sma=True,
-        market_regime="bullish",
-        extra_notes="Earnings report due in 2 weeks. Consider reducing size.",
+    # Simulate today's NASDAQ crash scenario
+    print("--- CRASH MODE EXAMPLE (2026-06-27) ---")
+    context = build_trading_context(
+        ticker="QQQ",
+        price=420.00,
+        rsi=28,
+        macd_signal="bearish",
+        above_200sma=False,
+        market_regime="crash",
+        nasdaq_change_pct=-4.7,
+        vix=40,
+        extra_notes="NASDAQ crash in progress as of 2026-06-27. Prioritise capital preservation.",
     )
-    print(sample)
+    print(context)
